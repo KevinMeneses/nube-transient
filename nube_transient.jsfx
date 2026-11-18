@@ -1,0 +1,776 @@
+desc:Nube Transient - transient shaper (ataque y cola +/-, independiente del nivel, lookahead, por banda)
+//tags: transient shaper transient-designer envelope attack sustain drums dynamics lookahead multiband
+//author: Kev Meneses + Claude (Claude Code)
+//license: GPL-3.0-or-later
+//version: 1.0.0
+
+slider1:0<-24,24,0.1>-Ataque (dB)
+slider2:0<-40,20,0.1>-Cola (dB)
+slider3:0<0,1,1{Golpe,Continuo}>-Modo
+slider4:6<1,20,0.1>-Sensibilidad (dB)
+slider5:15<1,100,0.1:log=10>-Duracion del ataque (ms)
+slider6:40<0,500,1>-Mantener (ms)
+slider7:60<5,2000,1:log=150>-Caida (ms)
+slider8:0<0,10,0.1>-Lookahead (ms)
+slider9:0<0,2,1{Todo,Solo graves,Solo agudos}>-Banda
+slider10:200<30,12000,1:log=600>-Corte (Hz)
+slider11:0<0,2,1{Normal,Solo la banda,Solo lo que cambia}>-Escuchar
+slider12:100<0,100,1>-Mezcla (%)
+slider13:0<-24,24,0.1>-Ganancia (dB)
+slider14:0<0,24,1{-,Snare (Nube baja),Clap (Nube baja),Cola corta (claude_cola_corta),Kick: mas pegada,Kick: mas corto,Kick: mas clic (solo agudos),Kick: punch en los graves,Snare: mas crack (solo agudos),Snare: mas cuerpo,Snare: suavizar el golpe,Clap: mas chasquido,Clap: seco,808: mas golpe al inicio,808: cola mas corta (drill),808: mas sostenido,Hi-hats: mas chick,Hi-hats: mas cortos,Loop de bateria: mas pegada (Continuo),Bus de bateria: menos ataque (Continuo),Bateria: quitar la sala (Continuo),Dembow / dancehall: snare seco,Percusion: seca y con pegada,Guitarra / pluck: suavizar el ataque (Continuo),Por defecto}>-Cargar preset
+
+in_pin:Entrada L
+in_pin:Entrada R
+out_pin:Salida L
+out_pin:Salida R
+
+options:gfx_hz=60 no_meter
+
+@init
+ext_noinit = 1;
+gfx_ext_retina = 1;
+
+DLN = 16384;       // lineas de retardo del lookahead: banda L, banda R, resto L, resto R
+dl = 0;
+cfx = 66000;       // coeficientes del cruce [g, k, a1, a2, a3]
+fst = 66010;       // estados de los filtros (6 etapas x 2)
+NH = 1000;         // historial: 1000 casillas de 6 ms = 6 s
+histIn = 70000; histOut = 71000; histG = 72000; histHit = 73000;
+NCAP = 600;        // forma del ultimo golpe: 600 casillas de 1 ms
+capG = 74000; capI = 75000; capO = 76000;
+hitmem = 80000;
+
+// ---------------------------------------------------------------- utilidades (solo para la interfaz y los presets)
+function clamp(x, a, b) ( x < a ? a : x > b ? b : x );
+function nlog(v, a, b) ( log(v / a) / log(b / a) );
+function dlog(n, a, b) ( a * (b / a) ^ n );
+function nlin(v, a, b) ( (v - a) / (b - a) );
+function dlin(n, a, b) ( a + (b - a) * n );
+
+function sset(i, v)
+(
+  i == 1 ? ( slider1 = v; slider_automate(slider1); ) : i == 2 ? ( slider2 = v; slider_automate(slider2); ) :
+  i == 3 ? ( slider3 = v; slider_automate(slider3); ) : i == 4 ? ( slider4 = v; slider_automate(slider4); ) :
+  i == 5 ? ( slider5 = v; slider_automate(slider5); ) : i == 6 ? ( slider6 = v; slider_automate(slider6); ) :
+  i == 7 ? ( slider7 = v; slider_automate(slider7); ) : i == 8 ? ( slider8 = v; slider_automate(slider8); ) :
+  i == 9 ? ( slider9 = v; slider_automate(slider9); ) : i == 10 ? ( slider10 = v; slider_automate(slider10); ) :
+  i == 11 ? ( slider11 = v; slider_automate(slider11); ) : i == 12 ? ( slider12 = v; slider_automate(slider12); ) :
+  i == 13 ? ( slider13 = v; slider_automate(slider13); ) : i == 14 ? ( slider14 = v; slider_automate(slider14); );
+);
+
+// ---------------------------------------------------------------- cruce Linkwitz-Riley 4o orden (SVF trapezoidal, Simper)
+// solo lo usa el hilo de audio (las funciones comparten variables entre hilos)
+function a_svf(x, s) local(v1, v2, v3)
+(
+  v3 = x - s[1];
+  v1 = cfx[2] * s[0] + cfx[3] * v3;
+  v2 = s[1] + cfx[3] * s[0] + cfx[4] * v3;
+  s[0] = 2 * v1 - s[0]; s[1] = 2 * v2 - s[1];
+  a_fhp = x - cfx[1] * v1 - v2;
+  v2;
+);
+// deja los graves en a_lo y los agudos en a_hi (a_lo + a_hi = pasa-todo, magnitud plana)
+function a_lr4(x, s) local(l1, h1)
+(
+  l1 = a_svf(x, s); h1 = a_fhp;
+  a_lo = a_svf(l1, s + 2);
+  a_svf(h1, s + 4); a_hi = a_fhp;
+);
+
+function update_params() local(tn)
+(
+  p_at = slider1;
+  flo = 10 ^ (slider2 / 20);
+  mode = slider3;
+  jump = 10 ^ (slider4 / 20);
+  sens = max(slider4, 0.1);
+  la_n = min(floor(slider8 * 0.001 * srate + 0.5), DLN - 1);
+  // Golpe: las mismas cuentas que claude_cola_corta; con lookahead el golpe se detecta antes y los tiempos se alargan
+  hold = slider6 * 0.001 * srate + la_n;
+  dec = slider7 * 0.001 * srate;
+  dur = slider5 * 0.001 * srate + la_n;
+  dtau = max(slider5 * 0.001 * srate / 3, 1);
+  // Continuo: maximo deslizante (15-30 ms: no sigue la onda de un 808), ataque lento = Duracion, memoria = Caida
+  wn = floor(0.015 * srate);
+  kas = 1 - exp(-1 / (max(slider5, 0.1) * 0.001 * srate));
+  krs = 1 - exp(-1 / (max(slider7, 1) * 0.001 * srate));
+  pdc_delay = la_n; pdc_bot_ch = 0; pdc_top_ch = 2;
+  band = slider9;
+  tn = tan($pi * min(max(slider10, 10), srate * 0.45) / srate);
+  cfx[0] = tn; cfx[1] = 1.41421356237; cfx[2] = 1 / (1 + tn * (tn + cfx[1])); cfx[3] = tn * cfx[2]; cfx[4] = tn * cfx[3];
+  listen = slider11;
+  mix_t = slider12 / 100;
+  mk_t = 10 ^ (slider13 / 20);
+);
+
+kfa = exp(-1 / (0.0005 * srate)); kfr = exp(-1 / (0.005 * srate));
+ksa = exp(-1 / (0.020 * srate)); ksr = exp(-1 / (0.150 * srate));
+kg = exp(-1 / (0.001 * srate));
+kga = 1 - exp(-1 / (0.0002 * srate));     // suavizado del ataque en Golpe (0.2 ms)
+krf = 1 - exp(-1 / (0.010 * srate));      // Continuo: envolvente rapida de la cola
+ksm = 1 - exp(-1 / (0.0005 * srate));     // Continuo: suavizado de la ganancia
+sm = 1 - exp(-16 / (0.02 * srate));       // mezcla y ganancia de salida
+tlock_n = floor(0.020 * srate);
+hslot = floor(0.006 * srate);
+cslot = floor(0.001 * srate);
+
+function reset_state()
+(
+  a_ef = 0; a_es = 0; a_tt = 100000; a_g = 1; a_gadb = 0; a_ta = 100000; a_et = 0;
+  a_wc = 0; a_cm = a_pm = 0; a_as = a_sf = a_ss = 0; a_gc = 0;
+  a_trp = 0; a_tl = 0;
+  memset(fst, 0, 12);
+);
+
+a_w = 0; a_hc = 0; hw = 0; upd = 0; a_cc = 0; cap_len = 0; a_cp = NCAP; n_hits = 0;
+_i = 0; loop(NH, histIn[_i] = histOut[_i] = -200; histG[_i] = 0; histHit[_i] = 0; _i += 1; );
+h_in = h_out = 0; h_gmax = h_gmin = 1; h_hit = 0;
+update_params();
+reset_state();
+a_mk = mk_t; a_mix = mix_t;
+
+// ---------------------------------------------------------------- presets
+NPRESETS = 24;
+function preset_name(n)
+(
+  n == 1 ? "Snare (Nube baja)" :
+  n == 2 ? "Clap (Nube baja)" :
+  n == 3 ? "Cola corta (claude_cola_corta)" :
+  n == 4 ? "Kick: mas pegada" :
+  n == 5 ? "Kick: mas corto" :
+  n == 6 ? "Kick: mas clic (solo agudos)" :
+  n == 7 ? "Kick: punch en los graves" :
+  n == 8 ? "Snare: mas crack (solo agudos)" :
+  n == 9 ? "Snare: mas cuerpo" :
+  n == 10 ? "Snare: suavizar el golpe" :
+  n == 11 ? "Clap: mas chasquido" :
+  n == 12 ? "Clap: seco" :
+  n == 13 ? "808: mas golpe al inicio" :
+  n == 14 ? "808: cola mas corta (drill)" :
+  n == 15 ? "808: mas sostenido" :
+  n == 16 ? "Hi-hats: mas chick" :
+  n == 17 ? "Hi-hats: mas cortos" :
+  n == 18 ? "Loop de bateria: mas pegada (Continuo)" :
+  n == 19 ? "Bus de bateria: menos ataque (Continuo)" :
+  n == 20 ? "Bateria: quitar la sala (Continuo)" :
+  n == 21 ? "Dembow / dancehall: snare seco" :
+  n == 22 ? "Percusion: seca y con pegada" :
+  n == 23 ? "Guitarra / pluck: suavizar el ataque (Continuo)" :
+  n == 24 ? "Por defecto" : "";
+);
+// pr(modo, ataque, cola, duracion, mantener, caida, lookahead)
+function pr(md, at, co, du, ho, ca, la)
+(
+  sset(3, md); sset(1, at); sset(2, co); sset(5, du); sset(6, ho); sset(7, ca); sset(8, la);
+);
+function load_preset(n)
+(
+  pr(0, 0, 0, 15, 40, 60, 0);
+  sset(4, 6); sset(9, 0); sset(10, 200); sset(11, 0); sset(12, 100); sset(13, 0);
+  // 1 y 2: los claude_cola_corta de la mezcla de Nube baja (suenan identicos)
+  n == 1 ? pr(0, 0, -4, 15, 70, 130, 0) :
+  n == 2 ? pr(0, 0, -8, 15, 60, 100, 0) :
+  n == 3 ? pr(0, 0, -12, 15, 40, 60, 0) :
+  n == 4 ? pr(0, 5, 0, 12, 40, 60, 1) :
+  n == 5 ? pr(0, 0, -12, 15, 90, 120, 2) :
+  n == 6 ? ( pr(0, 8, 0, 6, 40, 60, 1); sset(9, 2); sset(10, 2500); ) :
+  n == 7 ? ( pr(0, 4, 0, 30, 40, 60, 1); sset(9, 1); sset(10, 150); ) :
+  n == 8 ? ( pr(0, 6, 0, 10, 40, 60, 1); sset(9, 2); sset(10, 1500); ) :
+  n == 9 ? pr(0, 0, 4, 15, 30, 120, 0) :
+  n == 10 ? pr(0, -5, 0, 8, 40, 60, 1) :
+  n == 11 ? pr(0, 5, 0, 8, 40, 60, 1) :
+  n == 12 ? pr(0, 0, -10, 15, 45, 70, 2) :
+  // 808: sensibilidad 3 dB (la nota siguiente suele llegar con la anterior sonando)
+  n == 13 ? ( pr(0, 4, 0, 25, 40, 60, 1); sset(4, 3); ) :
+  n == 14 ? ( pr(0, 0, -14, 15, 200, 250, 2); sset(4, 3); ) :
+  n == 15 ? ( pr(0, 0, 5, 15, 100, 300, 0); sset(4, 3); ) :
+  n == 16 ? ( pr(0, 6, 0, 5, 40, 60, 0.5); sset(4, 4); ) :
+  n == 17 ? ( pr(0, 0, -12, 15, 15, 30, 1); sset(4, 4); ) :
+  n == 18 ? pr(1, 5, -2, 15, 40, 200, 1) :
+  n == 19 ? pr(1, -4, 0, 10, 40, 200, 1) :
+  n == 20 ? pr(1, 0, -10, 15, 40, 300, 0) :
+  n == 21 ? pr(0, 2, -8, 10, 50, 80, 2) :
+  n == 22 ? pr(0, 4, -8, 8, 40, 60, 1) :
+  n == 23 ? pr(1, -6, 0, 20, 40, 200, 1);
+  upd = 1;
+);
+
+@slider
+slider14 > 0 ? ( _pn = floor(slider14 + 0.5); slider14 = 0; slider_automate(slider14); load_preset(_pn); );
+update_params();
+
+@block
+upd ? ( upd = 0; update_params(); );
+// al dar play: el detector empieza de cero (como un JSFX sin ext_noinit) y la mezcla/ganancia saltan a su valor
+_ps = play_state & 5;
+(_ps && !last_ps) ? ( reset_state(); a_mk = mk_t; a_mix = mix_t; );
+!_ps ? ( a_mk = mk_t; a_mix = mix_t; );
+last_ps = _ps;
+
+@sample
+a_xl = spl0; a_xr = spl1;
+(a_cnt -= 1) <= 0 ? ( a_cnt = 16; a_mk += (mk_t - a_mk) * sm; a_mix += (mix_t - a_mix) * sm; );
+
+band ? (
+  a_lr4(a_xl, fst); band == 1 ? ( a_bL = a_lo; a_rL = a_hi; ) : ( a_bL = a_hi; a_rL = a_lo; );
+  a_lr4(a_xr, fst + 6); band == 1 ? ( a_bR = a_lo; a_rR = a_hi; ) : ( a_bR = a_hi; a_rR = a_lo; );
+) : (
+  a_bL = a_xl; a_bR = a_xr; a_rL = a_rR = 0;
+);
+
+// detector de golpes (el de claude_cola_corta): la envolvente rapida salta sobre la lenta
+a_v = max(abs(a_bL), abs(a_bR));
+a_ef = a_v > a_ef ? kfa * a_ef + (1 - kfa) * a_v : kfr * a_ef + (1 - kfr) * a_v;
+a_es = a_v > a_es ? ksa * a_es + (1 - ksa) * a_v : ksr * a_es + (1 - ksr) * a_v;
+a_hit = 0;
+
+mode == 0 ? (
+  // Golpe: ganancia 1 durante Mantener, despues cae hacia Cola; Ataque cubre los primeros ms del golpe
+  a_ef > a_es * jump && a_ef > 0.0001 && a_tt > hold ? ( a_tt = 0; a_hit = 1; a_ta = 0; a_et = a_ef; );
+  a_tg = a_tt < hold ? 1 : flo + (1 - flo) * exp(-6.9 * (a_tt - hold) / dec);
+  a_g = a_tg > a_g ? a_tg : kg * a_g + (1 - kg) * a_tg;
+  // la ventana del ataque se re-arma si dentro de ella el nivel vuelve a saltar (golpes con un pre-ruido antes del pico)
+  a_ta < dur && a_ef > a_et * jump ? ( a_ta = 0; a_et = a_ef; );
+  (p_at != 0 || a_gadb != 0) ? (
+    a_s = a_ta < dur ? 1 : exp(-(a_ta - dur) / dtau);
+    a_gadb += (p_at * a_s - a_gadb) * kga;
+    abs(a_gadb) < 0.000001 ? a_gadb = 0;
+    a_gain = a_g * exp(a_gadb * 0.11512925464970229);
+  ) : a_gain = a_g;
+  a_tt += 1; a_ta += 1;
+) : (
+  // Continuo: diferencias de envolventes en dB (no depende del nivel)
+  (a_wc -= 1) <= 0 ? ( a_wc = wn; a_pm = a_cm; a_cm = 0; );
+  a_v > a_cm ? a_cm = a_v;
+  a_h = max(a_cm, a_pm) + 0.000000001;
+  a_as = a_h > a_as ? a_as + (a_h - a_as) * kas : a_h;
+  a_sf = a_h > a_sf ? a_h : a_sf + (a_h - a_sf) * krf;
+  a_ss = a_h > a_ss ? a_h : a_ss + (a_h - a_ss) * krs;
+  a_da = 20 * log10(a_h / a_as); a_ds = 20 * log10(a_ss / a_sf);
+  a_t = p_at * min(a_da / sens, 1) + slider2 * min(a_ds / sens, 1);
+  a_gc += (a_t - a_gc) * ksm;
+  a_gain = exp(a_gc * 0.11512925464970229);
+  // golpe solo para la interfaz: flanco de subida del detector, 20 ms sin volver a marcar
+  a_x = a_ef > a_es * jump && a_ef > 0.0001;
+  a_tl > 0 ? a_tl -= 1;
+  a_hit = a_x && !a_trp && a_tl <= 0; a_hit ? a_tl = tlock_n; a_trp = a_x;
+);
+
+// lookahead: el audio se retrasa, la deteccion no
+dl[a_w] = a_bL; dl[DLN + a_w] = a_bR; dl[2 * DLN + a_w] = a_rL; dl[3 * DLN + a_w] = a_rR;
+a_r = a_w - la_n; a_r < 0 ? a_r += DLN;
+a_dbL = dl[a_r]; a_dbR = dl[DLN + a_r]; a_drL = dl[2 * DLN + a_r]; a_drR = dl[3 * DLN + a_r];
+(a_w += 1) >= DLN ? a_w = 0;
+
+a_gm = a_mix >= 1 ? a_gain : 1 + (a_gain - 1) * a_mix;
+listen == 2 ? (
+  spl0 = (a_gm - 1) * a_dbL; spl1 = (a_gm - 1) * a_dbR;
+) : listen == 1 ? (
+  spl0 = a_dbL * a_gm * a_mk; spl1 = a_dbR * a_gm * a_mk;
+) : (
+  spl0 = (a_drL + a_dbL * a_gm) * a_mk; spl1 = (a_drR + a_dbR * a_gm) * a_mk;
+);
+
+// medidores, historial y forma del ultimo golpe
+a_hit ? ( n_hits += 1; h_hit = 1; a_cp = 0; a_cc = 0; cap_len = 0; a_ci = a_co = 0; );
+a_x = max(abs(a_dbL + a_drL), abs(a_dbR + a_drR)); a_x > h_in ? h_in = a_x; a_x > m_in ? m_in = a_x; a_x > a_ci ? a_ci = a_x;
+a_y = max(abs(spl0), abs(spl1)); a_y > h_out ? h_out = a_y; a_y > m_out ? m_out = a_y; a_y > a_co ? a_co = a_y;
+a_gain > h_gmax ? h_gmax = a_gain; a_gain < h_gmin ? h_gmin = a_gain;
+g_now = a_gain;
+(a_hc -= 1) <= 0 ? (
+  a_hc = hslot;
+  histIn[hw] = 20 * log10(h_in + 0.0000001);
+  histOut[hw] = 20 * log10(h_out + 0.0000001);
+  // la ganancia que mas se aleja de 0 dB en la casilla
+  a_u = 20 * log10(h_gmax + 0.000000001); a_d = 20 * log10(h_gmin + 0.000000001);
+  histG[hw] = -a_d > a_u ? a_d : a_u;
+  histHit[hw] = h_hit;
+  (hw += 1) >= NH ? hw = 0;
+  h_in = h_out = 0; h_gmax = h_gmin = a_gain; h_hit = 0;
+);
+a_cp < NCAP ? (
+  (a_cc -= 1) <= 0 ? (
+    a_cc = cslot;
+    capG[a_cp] = 20 * log10(a_gain + 0.000000001);
+    capI[a_cp] = 20 * log10(a_ci + 0.0000001); capO[a_cp] = 20 * log10(a_co + 0.0000001);
+    a_ci = a_co = 0;
+    a_cp += 1; cap_len = a_cp;
+  );
+);
+
+@gfx 1000 640
+// ======================================================================= interfaz
+SC = gfx_ext_retina > 1 ? gfx_ext_retina : 1;
+WW = gfx_w; WH = gfx_h;
+
+function fnt(i) (
+  i == 1 ? gfx_setfont(1, "Helvetica Neue", 13 * SC) :
+  i == 2 ? gfx_setfont(2, "Helvetica Neue", 11 * SC) :
+  i == 3 ? gfx_setfont(3, "Helvetica Neue", 17 * SC, 'b') :
+  i == 4 ? gfx_setfont(4, "Helvetica Neue", 10 * SC, 'b') :
+           gfx_setfont(5, "Helvetica Neue", 12 * SC, 'b');
+);
+
+// color de cada modo
+function mode_rgb(m, a)
+(
+  m == 0 ? gfx_set(1.00, 0.64, 0.32, a) : gfx_set(0.38, 0.86, 0.80, a);
+);
+function acc(a) ( mode_rgb(slider3, a); );
+function mode_name(m) ( m == 0 ? "Golpe" : "Continuo"; );
+function band_name(b) ( b == 0 ? "Todo" : b == 1 ? "Graves" : "Agudos"; );
+function listen_name(b) ( b == 0 ? "Normal" : b == 1 ? "Banda" : "Cambios"; );
+
+function hit_add(x, y, w, h, id) local(p)
+( hit_n < 200 ? ( p = hitmem + hit_n * 5; p[0] = x; p[1] = y; p[2] = w; p[3] = h; p[4] = id; hit_n += 1; ); );
+function hit_find(mx, my) local(i, p, r)
+(
+  r = 0; i = hit_n - 1;
+  while (i >= 0 && r == 0) (
+    p = hitmem + i * 5;
+    (mx >= p[0] && mx < p[0] + p[2] && my >= p[1] && my < p[1] + p[3]) ? r = p[4];
+    i -= 1;
+  );
+  r;
+);
+
+function frect(x, y, w, h, r) (
+  r = min(r, min(w, h) * 0.5);
+  gfx_rect(x + r, y, w - 2 * r, h, 1);
+  gfx_rect(x, y + r, r, h - 2 * r, 1);
+  gfx_rect(x + w - r, y + r, r, h - 2 * r, 1);
+  gfx_circle(x + r, y + r, r, 1, 1); gfx_circle(x + w - r - 1, y + r, r, 1, 1);
+  gfx_circle(x + r, y + h - r - 1, r, 1, 1); gfx_circle(x + w - r - 1, y + h - r - 1, r, 1, 1);
+);
+function text_c(str, x, y, w, h) ( gfx_x = x; gfx_y = y; gfx_drawstr(str, 1 | 4, x + w, y + h); );
+function text_l(str, x, y, h) ( gfx_x = x; gfx_y = y; gfx_drawstr(str, 4, x + 2000, y + h); );
+function text_r(str, x, y, w, h) ( gfx_x = x; gfx_y = y; gfx_drawstr(str, 2 | 4, x + w, y + h); );
+
+function fmt_f(d, f) ( f < 1000 ? sprintf(d, "%d Hz", floor(f + 0.5)) : sprintf(d, f < 10000 ? "%.2f kHz" : "%.1f kHz", f / 1000); );
+function fmt_db(d, g) ( sprintf(d, "%s%.1f dB", g > 0.05 ? "+" : "", g); );
+function fmt_ms(d, t) ( t < 1 ? sprintf(d, "%.2f ms", t) : t < 10 ? sprintf(d, "%.1f ms", t) : t < 1000 ? sprintf(d, "%d ms", floor(t + 0.5)) : sprintf(d, "%.2f s", t / 1000); );
+
+function button(id, x, y, w, h, str, on)
+(
+  hov = hover_id == id;
+  on ? acc(1) : gfx_set(hov ? 0.24 : 0.17, hov ? 0.26 : 0.19, hov ? 0.31 : 0.24, 1);
+  frect(x, y, w, h, 5 * SC);
+  on ? gfx_set(0.07, 0.08, 0.10, 1) : gfx_set(0.86, 0.88, 0.92, 1);
+  fnt(1); text_c(str, x, y, w, h);
+  hit_add(x, y, w, h, id);
+);
+
+function dropdown(id, x, y, w, h, label, str)
+(
+  hov = hover_id == id;
+  gfx_set(hov ? 0.24 : 0.17, hov ? 0.26 : 0.19, hov ? 0.31 : 0.24, 1);
+  frect(x, y, w, h, 5 * SC);
+  fnt(2); gfx_set(0.55, 0.58, 0.65, 1);
+  text_l(label, x + 8 * SC, y, h);
+  strlen(label) ? gfx_measurestr(label, _tw, _th) : _tw = -4 * SC;
+  fnt(1); gfx_set(0.90, 0.92, 0.96, 1);
+  text_l(str, x + 12 * SC + _tw, y, h);
+  gfx_set(0.55, 0.58, 0.65, 1);
+  _cx = x + w - 12 * SC; _cy = y + h * 0.5;
+  gfx_triangle(_cx - 4 * SC, _cy - 2 * SC, _cx + 4 * SC, _cy - 2 * SC, _cx, _cy + 3 * SC);
+  hit_add(x, y, w, h, id);
+);
+
+// z = posicion normalizada del cero (perillas +/-: el arco sale desde ahi); z < 0 = arco desde el minimo
+function knob(id, cx, cy, r, label, str, n, z, enabled) local(a0, a1, av, az, i, rr)
+(
+  a0 = -0.75 * $pi; a1 = 0.75 * $pi; av = a0 + (a1 - a0) * clamp(n, 0, 1); az = z < 0 ? a0 : a0 + (a1 - a0) * z;
+  fnt(2); gfx_set(0.62, 0.65, 0.72, enabled ? 1 : 0.4);
+  text_c(label, cx - 50 * SC, cy - r - 18 * SC, 100 * SC, 14 * SC);
+  gfx_set(0.13, 0.14, 0.18, 1); gfx_circle(cx, cy, r, 1, 1);
+  gfx_set(0.26, 0.28, 0.34, 1);
+  i = 0; loop(3 * SC, gfx_arc(cx, cy, r - 2 * SC - i, a0, a1, 1); i += 1; );
+  acc(enabled ? 1 : 0.35);
+  i = 0; loop(3 * SC, rr = r - 2 * SC - i;
+    av < az ? gfx_arc(cx, cy, rr, av, az, 1) : gfx_arc(cx, cy, rr, az, av, 1);
+    i += 1; );
+  z >= 0 ? ( gfx_set(1, 1, 1, 0.35); gfx_line(cx + sin(az) * (r - 1 * SC), cy - cos(az) * (r - 1 * SC), cx + sin(az) * (r + 3 * SC), cy - cos(az) * (r + 3 * SC), 1); );
+  gfx_set(0.92, 0.93, 0.96, enabled ? 1 : 0.4);
+  gfx_line(cx + sin(av) * r * 0.25, cy - cos(av) * r * 0.25, cx + sin(av) * (r - 6 * SC), cy - cos(av) * (r - 6 * SC), 1);
+  hover_id == id ? ( gfx_set(1, 1, 1, 0.12); gfx_circle(cx, cy, r + 2 * SC, 0, 1); );
+  fnt(1); gfx_set(0.92, 0.93, 0.96, enabled ? 1 : 0.45);
+  text_c(str, cx - 50 * SC, cy + r + 3 * SC, 100 * SC, 16 * SC);
+  hit_add(cx - r - 8 * SC, cy - r - 4 * SC, 2 * r + 16 * SC, 2 * r + 24 * SC, id);
+);
+
+// ---------------------------------------------------------- controles: id -> slider, minimo, maximo, log, defecto, paso
+function ctl_info(id)
+(
+  id == 1 ? ( ci_s = 1; ci_a = -24; ci_b = 24; ci_l = 0; ci_d = 0; ci_p = 0.1; ) :
+  id == 2 ? ( ci_s = 2; ci_a = -40; ci_b = 20; ci_l = 0; ci_d = 0; ci_p = 0.1; ) :
+  id == 3 ? ( ci_s = 4; ci_a = 1; ci_b = 20; ci_l = 0; ci_d = 6; ci_p = 0.1; ) :
+  id == 4 ? ( ci_s = 5; ci_a = 1; ci_b = 100; ci_l = 1; ci_d = 15; ci_p = 0.1; ) :
+  id == 5 ? ( ci_s = 6; ci_a = 0; ci_b = 500; ci_l = 0; ci_d = 40; ci_p = 1; ) :
+  id == 6 ? ( ci_s = 7; ci_a = 5; ci_b = 2000; ci_l = 1; ci_d = 60; ci_p = 1; ) :
+  id == 7 ? ( ci_s = 8; ci_a = 0; ci_b = 10; ci_l = 0; ci_d = 0; ci_p = 0.1; ) :
+  id == 8 ? ( ci_s = 10; ci_a = 30; ci_b = 12000; ci_l = 1; ci_d = 200; ci_p = 1; ) :
+  id == 9 ? ( ci_s = 12; ci_a = 0; ci_b = 100; ci_l = 0; ci_d = 100; ci_p = 1; ) :
+  id == 10 ? ( ci_s = 13; ci_a = -24; ci_b = 24; ci_l = 0; ci_d = 0; ci_p = 0.1; ) :
+  ci_s = 0;
+);
+function ctl_get(id) local(v)
+( ctl_info(id); v = slider(ci_s); ci_l ? nlog(v, ci_a, ci_b) : nlin(v, ci_a, ci_b); );
+function ctl_setv(id, v)
+(
+  ctl_info(id);
+  v = clamp(floor(v / ci_p + 0.5) * ci_p, ci_a, ci_b);
+  sset(ci_s, v); upd = 1;
+);
+function ctl_set(id, n) ( ctl_info(id); n = clamp(n, 0, 1); ctl_setv(id, ci_l ? dlog(n, ci_a, ci_b) : dlin(n, ci_a, ci_b)); );
+function ctl_default(id) ( ctl_info(id); ctl_setv(id, ci_d); );
+
+// ganancia teorica de Golpe a los t ms del golpe (copia de la del audio, para la grafica; sin el suavizado de 1 ms)
+function shape_db(t) local(la, h, s, g)
+(
+  la = floor(slider8 * 0.001 * srate + 0.5) / srate * 1000;
+  h = slider6 + la;
+  g = t < h ? 0 : 20 * log10(max(10 ^ (slider2 / 20) + (1 - 10 ^ (slider2 / 20)) * exp(-6.9 * (t - h) / slider7), 0.000001));
+  s = t < slider5 + la ? 1 : exp(-(t - slider5 - la) / max(slider5 / 3, 1000 / srate));
+  g + slider1 * s;
+);
+
+// ---------------------------------------------------------- ayudas
+function mode_desc(m, line)
+(
+  m == 0 ? (
+    line == 0 ? "Detecta cada golpe (el nivel salta Sensibilidad dB)." :
+    line == 1 ? "Ataque: sube o baja los primeros ms (Duracion)." :
+                "Cola: despues de Mantener cae a ese nivel en Caida.";
+  ) : (
+    line == 0 ? "Compara envolventes rapidas y lentas, en dB:" :
+    line == 1 ? "Ataque = lo que crece; Cola = lo que decae mas" :
+                "rapido que la Caida. Para loops, buses y pads.";
+  );
+);
+
+function hint_for(id)
+(
+  id == 1 ? strcpy(#hint, "Ataque: + = mas golpe (punch, clic); - = golpe mas suave. Sube o baja los primeros ms de cada golpe.") :
+  id == 2 ? strcpy(#hint, "Cola: - = mas corto y seco (menos sala, menos resonancia); + = mas cuerpo y sostenido.") :
+  id == 3 ? strcpy(#hint, "Sensibilidad: cuanto tiene que saltar el nivel para contar como golpe. Menos = detecta golpes mas suaves.") :
+  id == 4 ? strcpy(#hint, "Duracion del ataque: cuanto del comienzo cuenta como ataque. 2-8 ms = clic; 10-30 ms = punch / cuerpo.") :
+  id == 5 ? strcpy(#hint, "Mantener (Golpe): la cola no se toca durante este tiempo despues del golpe. Mas = cuerpo intacto.") :
+  id == 6 ? strcpy(#hint, slider3 ? "Caida (Continuo): memoria del pico. Mas larga = mas parte del decaimiento cuenta como cola." :
+                                    "Caida: tiempo que tarda la cola en llegar al nivel de Cola, despues de Mantener.") :
+  id == 7 ? strcpy(#hint, "Lookahead: detecta antes y el Ataque no se pierde el primer ms. Agrega esa latencia (REAPER la compensa).") :
+  id == 8 ? strcpy(#hint, "Corte: frecuencia que separa graves y agudos (cruce LR4) en los modos Solo graves / Solo agudos.") :
+  id == 9 ? strcpy(#hint, "Mezcla: menos de 100% mezcla la senal original (en paralelo). Parecido a bajar Ataque y Cola.") :
+  id == 10 ? strcpy(#hint, "Ganancia: volumen de salida (subir el ataque sube los picos: mira el medidor OUT).") :
+  id == 30 ? strcpy(#hint, "Presets: puntos de partida (incluye el snare y el clap de Nube baja). Para guardar los tuyos usa el + de REAPER.") :
+  (id == 40 || id == 41) ? (
+    strcpy(#hint, mode_name(id - 40)); strcat(#hint, ": "); strcat(#hint, mode_desc(id - 40, 0)); strcat(#hint, " "); strcat(#hint, mode_desc(id - 40, 1));
+  ) :
+  id == 50 ? strcpy(#hint, "Banda Todo: procesa la senal completa.") :
+  id == 51 ? strcpy(#hint, "Solo graves: detecta y procesa solo bajo el Corte (ej. el punch del kick sin tocar el clic).") :
+  id == 52 ? strcpy(#hint, "Solo agudos: detecta y procesa solo sobre el Corte (ej. el crack del snare sin tocar el cuerpo).") :
+  id == 60 ? strcpy(#hint, "Escuchar normal.") :
+  id == 61 ? strcpy(#hint, "Escuchar la banda: suena solo la banda que se procesa (con el efecto). Para ajustar el Corte.") :
+  id == 62 ? strcpy(#hint, "Escuchar cambios: suena SOLO lo que se agrega o se quita. Ataque = clics; Cola = la sala / la resonancia.") :
+  id == 100 ? strcpy(#hint, "Historial: gris = entrada, color = salida; abajo la ganancia (arriba sube, abajo baja) y los golpes. Rueda = Ataque") :
+  id == 101 ? strcpy(#hint, "Forma del ultimo golpe: gris = entrada, color = salida. Arrastra arriba/abajo = Cola, lados = Mantener/Caida; rueda = Ataque") :
+  id == 102 ? strcpy(#hint, "Medidores: entrada, ganancia (verde sube, rojo baja) y salida, con el maximo arriba. Clic = reiniciar maximos.") :
+  strcpy(#hint, "Nube Transient: elige un preset o mueve Ataque y Cola. Pasa el mouse sobre cualquier cosa para ver que hace.");
+);
+
+// ---------------------------------------------------------- menus
+function menu_presets() local(r, i)
+(
+  #m = "#PRESETS DE NUBE TRANSIENT";
+  i = 1; loop(NPRESETS, strcat(#m, "|"); strcat(#m, preset_name(i)); i += 1; );
+  gfx_x = mouse_x; gfx_y = mouse_y;
+  r = gfx_showmenu(#m);
+  r >= 2 ? load_preset(r - 1);
+);
+
+// ======================================================================= layout
+TOPH = 44 * SC; PANH = 228 * SC; FOOTH = 26 * SC;
+dy = TOPH + 10 * SC;
+dh = WH - TOPH - PANH - FOOTH - 20 * SC; dh < 140 * SC ? dh = 140 * SC;
+MW = 96 * SC; mx0 = WW - 14 * SC - MW;
+ts = min(dh, (WW - MW - 90 * SC) * 0.42);
+tx = mx0 - 16 * SC - ts; ty = dy + (dh - ts) * 0.5;
+hx = 40 * SC; hgw = tx - 16 * SC - hx; hy = dy; hh = dh;
+py = dy + dh + 10 * SC;
+// historial: arriba el nivel (-60..0 dB), abajo la ganancia (+/- GR dB)
+hlh = floor(hh * 0.64); gly = hy + hlh + 8 * SC; glh = hh - hlh - 8 * SC;
+GR = max(abs(slider1), abs(slider2)) > 12 ? 24 : 12;
+function h2y(d) ( hy + hlh * clamp(-d / 60, 0, 1) );
+function g2y(d) ( gly + glh * 0.5 * (1 - clamp(d / GR, -1, 1)) );
+// forma: arriba envolventes relativas (0..-48 dB), abajo la ganancia
+flh = floor(ts * 0.62); fgy = ty + flh + 8 * SC; fgh = ts - flh - 8 * SC;
+TF = slider3 == 0 ? clamp(slider6 + slider7 * 2 + slider8, 80, NCAP) : clamp(slider5 * 3 + slider7 * 2, 80, NCAP);
+function f2x(t) ( tx + ts * clamp(t / TF, 0, 1) );
+function fy(d) ( ty + flh * clamp(-d / 48, 0, 1) );
+function fg2y(d) ( fgy + fgh * 0.5 * (1 - clamp(d / GR, -1, 1)) );
+
+// ======================================================================= mouse
+mx = mouse_x; my = mouse_y;
+lb = mouse_cap & 1; rb = mouse_cap & 2; shift = mouse_cap & 8;
+hover_id = drag ? drag_id : hit_find(mx, my);
+
+lb && !last_lb ? (
+  _now = time_precise();
+  dbl = _now - last_t < 0.35 && abs(mx - last_x) < 6 * SC && abs(my - last_y) < 6 * SC;
+  last_t = dbl ? 0 : _now; last_x = mx; last_y = my;
+  (hover_id >= 1 && hover_id <= 10) ? (
+    dbl ? ctl_default(hover_id) : ( drag = 1; drag_id = hover_id; drag_my = my; drag_n = ctl_get(hover_id); );
+  ) : hover_id == 101 ? (
+    drag = 1; drag_id = 101; drag_mx = mx; drag_my = my; drag_v = slider2; drag_n = ctl_get(slider3 ? 6 : 5);
+  ) : hover_id == 102 ? ( m_in = m_out = 0; pk_in = pk_out = 0; pk_gu = pk_gd = 0; )
+    : hover_id == 30 ? menu_presets()
+    : (hover_id == 40 || hover_id == 41) ? ( sset(3, hover_id - 40); upd = 1; )
+    : (hover_id >= 50 && hover_id <= 52) ? ( sset(9, hover_id - 50); upd = 1; )
+    : (hover_id >= 60 && hover_id <= 62) ? ( sset(11, hover_id - 60); upd = 1; );
+);
+
+lb && drag ? (
+  _k = shift ? 0.1 : 1;
+  (drag_id >= 1 && drag_id <= 10) ? ctl_set(drag_id, drag_n + (drag_my - my) / (220 * SC) * _k) :
+  drag_id == 101 ? (
+    ctl_setv(2, drag_v - (my - drag_my) / flh * 48 * _k);
+    ctl_set(slider3 ? 6 : 5, drag_n + (mx - drag_mx) / ts * _k);
+  );
+);
+!lb ? drag = 0;
+
+rb && !last_rb ? ( (hover_id == 100 || hover_id == 101) ? menu_presets(); );
+
+mouse_wheel != 0 ? (
+  _w = mouse_wheel / 120;
+  (hover_id >= 1 && hover_id <= 10) ? ctl_set(hover_id, ctl_get(hover_id) + _w * (shift ? 0.002 : 0.012)) :
+  (hover_id == 100 || hover_id == 101) ? ctl_setv(1, slider1 + _w * (shift ? 0.1 : 0.5));
+  mouse_wheel = 0;
+);
+last_lb = lb; last_rb = rb;
+
+// ======================================================================= dibujo
+hit_n = 0;
+gfx_set(0.075, 0.082, 0.105, 1); gfx_rect(0, 0, WW, WH, 1);
+
+// ---- barra superior
+gfx_set(0.10, 0.11, 0.14, 1); gfx_rect(0, 0, WW, TOPH, 1);
+fnt(3); gfx_set(0.62, 0.80, 1.0, 1); text_l("NUBE", 14 * SC, 0, TOPH);
+gfx_measurestr("NUBE ", _tw, _th);
+gfx_set(0.93, 0.94, 0.97, 1); text_l("TRANSIENT", 14 * SC + _tw, 0, TOPH);
+_x = 170 * SC; _y = 9 * SC; _h = 26 * SC;
+dropdown(30, _x, _y, 120 * SC, _h, "", "Presets"); _x += 136 * SC;
+fnt(2); gfx_set(0.55, 0.58, 0.65, 1); text_l("ESCUCHAR", _x, _y, _h); _x += 64 * SC;
+_k = 0;
+loop(3,
+  button(60 + _k, _x, _y, (_k == 0 ? 74 : 80) * SC, _h, _k == 0 ? "Normal" : _k == 1 ? "Banda" : "Cambios", slider11 == _k);
+  _x += (_k == 0 ? 78 : 84) * SC; _k += 1;
+);
+// indicador de golpe: se enciende 120 ms con cada golpe detectado
+n_hits != seen_hits ? ( seen_hits = n_hits; hit_on_t = time_precise(); );
+_on = time_precise() - hit_on_t < 0.12;
+_x + 120 * SC < WW ? (
+  _ow = WW - 14 * SC - _x; _ow > 130 * SC ? ( _x += _ow - 130 * SC; _ow = 130 * SC; );
+  _on ? acc(1) : gfx_set(0.17, 0.19, 0.24, 1);
+  frect(_x, _y, _ow, _h, 5 * SC);
+  fnt(5); _on ? gfx_set(0.07, 0.08, 0.10, 1) : gfx_set(0.62, 0.65, 0.72, 1);
+  text_c("GOLPE", _x, _y, _ow, _h);
+);
+
+// ---- historial
+gfx_set(0.095, 0.105, 0.135, 1); gfx_rect(hx, hy, hgw, hh, 1);
+fnt(2);
+_d = 0;
+while (_d >= -60) (
+  _yy = h2y(_d);
+  gfx_set(1, 1, 1, _d == 0 ? 0.10 : 0.045); gfx_line(hx, _yy, hx + hgw - 1, _yy);
+  gfx_set(0.50, 0.53, 0.60, 1);
+  sprintf(#s, "%d", _d);
+  _d > -60 ? text_r(#s, 0, _yy - 7 * SC, hx - 6 * SC, 14 * SC);
+  _d -= 12;
+);
+// carril de la ganancia
+gfx_set(0.085, 0.093, 0.12, 1); gfx_rect(hx, gly, hgw, glh, 1);
+gfx_set(1, 1, 1, 0.10); gfx_line(hx, g2y(0), hx + hgw - 1, g2y(0));
+gfx_set(1, 1, 1, 0.04); gfx_line(hx, g2y(GR * 0.5), hx + hgw - 1, g2y(GR * 0.5)); gfx_line(hx, g2y(-GR * 0.5), hx + hgw - 1, g2y(-GR * 0.5));
+gfx_set(0.50, 0.53, 0.60, 1);
+sprintf(#s, "+%d", GR); text_r(#s, 0, gly - 2 * SC, hx - 6 * SC, 14 * SC);
+text_r("0", 0, g2y(0) - 7 * SC, hx - 6 * SC, 14 * SC);
+sprintf(#s, "-%d", GR); text_r(#s, 0, gly + glh - 12 * SC, hx - 6 * SC, 14 * SC);
+_wi = hw; _ncol = floor(hgw / SC);
+_spc = 600 / _ncol;    // 600 casillas (3.6 s) en todo el ancho
+_c = 0; _pxi = -1;
+loop(_ncol,
+  _age = (_ncol - 1 - _c) * _spc;
+  _i0 = _wi - 1 - floor(_age + _spc); _i1 = _wi - 1 - floor(_age);
+  _vi = -200; _vo = -200; _vg = 0; _vh = 0;
+  _i = _i0;
+  while (_i <= _i1) (
+    _j = _i; _j < 0 ? _j += NH; _j < 0 ? _j += NH;
+    _vi = max(_vi, histIn[_j]); _vo = max(_vo, histOut[_j]); abs(histG[_j]) > abs(_vg) ? _vg = histG[_j]; _vh = max(_vh, histHit[_j]);
+    _i += 1;
+  );
+  _xx = hx + _c * SC;
+  _yi = h2y(_vi); _yo = h2y(_vo); _yg = g2y(_vg);
+  gfx_set(0.55, 0.58, 0.66, 0.28); gfx_line(_xx, _yi, _xx, hy + hlh - 1);
+  acc(0.12); gfx_line(_xx, _yo, _xx, hy + hlh - 1);
+  _vg > 0.05 ? ( gfx_set(0.42, 0.85, 0.55, 0.35); gfx_line(_xx, _yg, _xx, g2y(0)); )
+  : _vg < -0.05 ? ( gfx_set(1.0, 0.45, 0.40, 0.35); gfx_line(_xx, g2y(0), _xx, _yg); );
+  _vh ? ( acc(0.9); gfx_line(_xx, gly + glh - 5 * SC, _xx, gly + glh - 1); gfx_set(1, 1, 1, 0.07); gfx_line(_xx, hy, _xx, hy + hlh - 1); );
+  _pxi >= 0 ? (
+    acc(0.95); gfx_line(_pxx, _pyo, _xx, _yo, 1);
+    gfx_set(0.92, 0.93, 0.96, 0.9); gfx_line(_pxx, _pyg, _xx, _yg, 1);
+  );
+  _pxi = 1; _pxx = _xx; _pyo = _yo; _pyg = _yg;
+  _c += 1;
+);
+fnt(4); _xx = hx + hgw - 8 * SC;
+acc(1); gfx_measurestr("SALIDA", _tw, _th); _xx -= _tw; text_l("SALIDA", _xx, hy + 6 * SC, 14 * SC);
+gfx_set(0.62, 0.65, 0.72, 1); gfx_measurestr("ENTRADA", _tw, _th); _xx -= _tw + 14 * SC; text_l("ENTRADA", _xx, hy + 6 * SC, 14 * SC);
+gfx_set(0.62, 0.65, 0.72, 1); text_l("GANANCIA", hx + 8 * SC, gly + 3 * SC, 14 * SC);
+hit_add(hx, hy, hgw, hh, 100);
+
+// ---- forma del ultimo golpe
+gfx_set(0.095, 0.105, 0.135, 1); gfx_rect(tx, ty, ts, ts, 1);
+gfx_set(0.085, 0.093, 0.12, 1); gfx_rect(tx, fgy, ts, fgh, 1);
+_d = -12; loop(3, gfx_set(1, 1, 1, 0.045); gfx_line(tx, fy(_d), tx + ts - 1, fy(_d)); _d -= 12; );
+_t = TF > 300 ? 100 : TF > 150 ? 50 : 20; _tt = _t;
+while (_tt < TF) ( gfx_set(1, 1, 1, 0.045); gfx_line(f2x(_tt), ty, f2x(_tt), ty + ts - 1); _tt += _t; );
+gfx_set(1, 1, 1, 0.10); gfx_line(tx, fg2y(0), tx + ts - 1, fg2y(0));
+// mantener / duracion del ataque (Golpe)
+slider3 == 0 ? (
+  _la = floor(slider8 * 0.001 * srate + 0.5) / srate * 1000;
+  acc(0.07); gfx_rect(tx, ty, f2x(slider6 + _la) - tx, ts, 1);
+  slider1 != 0 ? ( acc(0.10); gfx_rect(tx, ty, f2x(slider5 + _la) - tx, ts, 1); );
+);
+// envolventes capturadas (relativas al pico de la entrada)
+_n = min(cap_len, floor(TF));
+_n > 1 ? (
+  _pk = -200; _i = 0; loop(_n, _pk = max(_pk, capI[_i]); _i += 1; );
+  _i = 0;
+  loop(_n,
+    // envolvente: maximo de los ultimos 12 ms (no sigue cada ciclo de un kick o un 808)
+    _vI = _vO = -200; _j = max(_i - 11, 0); while (_j <= _i) ( _vI = max(_vI, capI[_j]); _vO = max(_vO, capO[_j]); _j += 1; );
+    _xx = f2x(_i + 0.5); _yo = fy(_vO - _pk);
+    gfx_set(0.55, 0.58, 0.66, 0.30); gfx_line(_xx, fy(_vI - _pk), _xx, ty + flh - 1);
+    _i > 0 ? (
+      acc(1); gfx_line(_pxx, _pyo, _xx, _yo, 1);
+      gfx_set(0.92, 0.93, 0.96, 0.9); gfx_line(_pxx, fg2y(capG[_i - 1]), _xx, fg2y(capG[_i]), 1);
+    );
+    _pxx = _xx; _pyo = _yo; _i += 1;
+  );
+);
+// forma teorica de la ganancia (Golpe)
+slider3 == 0 ? (
+  _c = 0; _nn = floor(ts / SC);
+  loop(_nn + 1,
+    _tt = TF * _c / _nn; _yy = fg2y(shape_db(_tt)); _xx = tx + _c * SC;
+    _c > 0 && (_c & 3) < 2 ? ( acc(0.8); gfx_line(_pxx, _pyy, _xx, _yy, 1); );
+    _pxx = _xx; _pyy = _yy; _c += 1;
+  );
+);
+fnt(4); gfx_set(0.50, 0.53, 0.60, 1);
+sprintf(#s, "%d ms", floor(TF + 0.5)); text_r(#s, tx, ty + ts - 16 * SC, ts - 6 * SC, 14 * SC);
+acc(1); text_l("FORMA DEL ULTIMO GOLPE", tx + 6 * SC, ty + 4 * SC, 14 * SC);
+gfx_set(0.62, 0.65, 0.72, 1); text_l(slider3 == 0 ? "GANANCIA (punteada = teorica)" : "GANANCIA", tx + 6 * SC, fgy + 3 * SC, 14 * SC);
+(hover_id == 101 || (drag_id == 101 && drag)) ? ( gfx_set(1, 1, 1, 0.25); gfx_rect(tx, ty, ts, ts, 0); );
+hit_add(tx, ty, ts, ts, 101);
+
+// ---- medidores
+pk_in = max(m_in, pk_in * 0.999); pk_out = max(m_out, pk_out * 0.999);
+_gdb = 20 * log10(g_now + 0.000000001);
+pk_gu = max(pk_gu, _gdb); pk_gd = min(pk_gd, _gdb);
+_mi = m_in; _mo = m_out; m_in *= 0.82; m_out *= 0.82;
+_mt = dy + 18 * SC; _mh = dh - 36 * SC; _bw = 18 * SC;
+_k = 0;
+loop(3,
+  _xx = mx0 + 8 * SC + _k * 28 * SC;
+  gfx_set(0.13, 0.14, 0.18, 1); gfx_rect(_xx, _mt, _bw, _mh, 1);
+  _k == 1 ? (
+    _lv = clamp(_gdb / GR, -1, 1); _cy = _mt + _mh * 0.5;
+    _lv > 0 ? ( gfx_set(0.42, 0.85, 0.55, 1); gfx_rect(_xx, _cy - _mh * 0.5 * _lv, _bw, _mh * 0.5 * _lv, 1); )
+            : ( gfx_set(1.0, 0.45, 0.40, 1); gfx_rect(_xx, _cy, _bw, -_mh * 0.5 * _lv, 1); );
+    gfx_set(1, 1, 1, 0.3); gfx_line(_xx, _cy, _xx + _bw - 1, _cy);
+    sprintf(#s, "%+.1f", abs(pk_gd) > pk_gu ? pk_gd : pk_gu);
+  ) : (
+    _v = _k == 0 ? _mi : _mo;
+    _pdb = 20 * log10(_v + 0.000000001);
+    _lv = clamp((_pdb + 60) / 66, 0, 1);
+    _pdb > -0.1 ? gfx_set(1, 0.35, 0.3, 1) : _pdb > -6 ? gfx_set(0.95, 0.85, 0.35, 1) : gfx_set(0.42, 0.85, 0.55, 1);
+    gfx_rect(_xx, _mt + _mh * (1 - _lv), _bw, _mh * _lv, 1);
+    _pk = 20 * log10((_k == 0 ? pk_in : pk_out) + 0.000000001);
+    _pk > -60 ? sprintf(#s, "%.1f", _pk) : strcpy(#s, "-inf");
+    gfx_set(1, 1, 1, 0.6); _yy = _mt + _mh * (1 - clamp((_pk + 60) / 66, 0, 1)); gfx_line(_xx, _yy, _xx + _bw - 1, _yy);
+  );
+  fnt(4); gfx_set(0.80, 0.82, 0.88, 1); text_c(#s, _xx - 6 * SC, dy, _bw + 12 * SC, 16 * SC);
+  gfx_set(0.50, 0.53, 0.60, 1); text_c(_k == 0 ? "IN" : _k == 1 ? "GAN" : "OUT", _xx - 6 * SC, _mt + _mh + 2 * SC, _bw + 12 * SC, 16 * SC);
+  _k += 1;
+);
+hit_add(mx0, dy, MW, dh, 102);
+
+// ---- panel inferior
+gfx_set(0.10, 0.11, 0.14, 1); gfx_rect(0, py - 4 * SC, WW, WH - py + 4 * SC, 1);
+_x = 14 * SC; _y = py + 6 * SC; _h = 28 * SC;
+fnt(2); gfx_set(0.55, 0.58, 0.65, 1); text_l("MODO", _x, _y, _h); _x += 56 * SC;
+_k = 0;
+loop(2,
+  _on = slider3 == _k; _hv = hover_id == 40 + _k;
+  _on ? mode_rgb(_k, 1) : gfx_set(_hv ? 0.24 : 0.16, _hv ? 0.26 : 0.18, _hv ? 0.31 : 0.23, 1);
+  frect(_x, _y, 110 * SC, _h, 5 * SC);
+  !_on ? ( mode_rgb(_k, 1); gfx_rect(_x + 10 * SC, _y + _h * 0.5 - 3 * SC, 6 * SC, 6 * SC, 1); );
+  fnt(5); _on ? gfx_set(0.07, 0.08, 0.10, 1) : gfx_set(0.86, 0.88, 0.92, 1);
+  text_c(mode_name(_k), _x, _y, 110 * SC, _h);
+  hit_add(_x, _y, 110 * SC, _h, 40 + _k);
+  _x += 114 * SC; _k += 1;
+);
+_x += 20 * SC;
+fnt(2); gfx_set(0.55, 0.58, 0.65, 1); text_l("BANDA", _x, _y, _h); _x += 52 * SC;
+_k = 0;
+loop(3,
+  button(50 + _k, _x, _y, (_k == 0 ? 70 : 104) * SC, _h, _k == 0 ? "Todo" : _k == 1 ? "Solo graves" : "Solo agudos", slider9 == _k);
+  _x += (_k == 0 ? 74 : 108) * SC; _k += 1;
+);
+
+// fila principal de perillas
+_ky = py + 92 * SC; _kr = 24 * SC; _kx = 52 * SC; _ks = 80 * SC;
+fmt_db(#s, slider1); knob(1, _kx, _ky, _kr, "Ataque", #s, ctl_get(1), 0.5, 1); _kx += _ks;
+fmt_db(#s, slider2); knob(2, _kx, _ky, _kr, "Cola", #s, ctl_get(2), 40 / 60, 1); _kx += _ks;
+sprintf(#s, "%.1f dB", slider4); knob(3, _kx, _ky, _kr, "Sensibilidad", #s, ctl_get(3), -1, 1); _kx += _ks;
+fmt_ms(#s, slider5); knob(4, _kx, _ky, _kr, "Duracion", #s, ctl_get(4), -1, 1); _kx += _ks;
+fmt_ms(#s, slider6); knob(5, _kx, _ky, _kr, "Mantener", #s, ctl_get(5), -1, slider3 == 0); _kx += _ks;
+fmt_ms(#s, slider7); knob(6, _kx, _ky, _kr, slider3 ? "Memoria" : "Caida", #s, ctl_get(6), -1, 1); _kx += _ks;
+sprintf(#s, "%.1f ms", slider8); knob(7, _kx, _ky, _kr, "Lookahead", slider8 > 0 ? #s : "Apagado", ctl_get(7), -1, 1); _kx += _ks;
+// tarjeta del modo
+_cx = _kx - 26 * SC; _cw = WW - 14 * SC - _cx;
+_cw > 180 * SC ? (
+  gfx_set(0.13, 0.14, 0.18, 1); frect(_cx, py + 46 * SC, _cw, 84 * SC, 6 * SC);
+  acc(1); gfx_rect(_cx, py + 52 * SC, 3 * SC, 72 * SC, 1);
+  fnt(5); text_l(slider3 ? "Continuo" : "Golpe", _cx + 14 * SC, py + 52 * SC, 18 * SC);
+  fnt(2); gfx_set(0.72, 0.75, 0.82, 1);
+  text_l(mode_desc(slider3, 0), _cx + 14 * SC, py + 72 * SC, 16 * SC);
+  text_l(mode_desc(slider3, 1), _cx + 14 * SC, py + 88 * SC, 16 * SC);
+  text_l(mode_desc(slider3, 2), _cx + 14 * SC, py + 104 * SC, 16 * SC);
+);
+
+// fila secundaria: corte de la banda, mezcla y ganancia
+gfx_set(1, 1, 1, 0.06); gfx_line(14 * SC, py + 140 * SC, WW - 14 * SC, py + 140 * SC);
+_ky = py + 184 * SC; _kr = 17 * SC; _kx = 46 * SC; _ks = 72 * SC;
+fmt_f(#s, slider10); knob(8, _kx, _ky, _kr, "Corte", #s, ctl_get(8), -1, slider9 > 0); _kx += _ks;
+sprintf(#s, "%d %%", slider12); knob(9, _kx, _ky, _kr, "Mezcla", #s, ctl_get(9), -1, 1); _kx += _ks;
+fmt_db(#s, slider13); knob(10, _kx, _ky, _kr, "Ganancia", #s, ctl_get(10), 0.5, 1); _kx += _ks;
+_sx = _kx - 18 * SC;
+gfx_set(1, 1, 1, 0.06); gfx_line(_sx, py + 150 * SC, _sx, py + 218 * SC);
+_sx += 14 * SC;
+fnt(2); gfx_set(0.62, 0.65, 0.72, 1);
+slider8 > 0 ? ( sprintf(#s, "Latencia: %.1f ms (REAPER la compensa)", floor(slider8 * 0.001 * srate + 0.5) / srate * 1000); text_l(#s, _sx, py + 158 * SC, 16 * SC); )
+            : text_l("Sin lookahead: sin latencia", _sx, py + 158 * SC, 16 * SC);
+slider9 ? ( fmt_f(#b, slider10); sprintf(#s, "Banda: %s %s", slider9 == 1 ? "graves bajo" : "agudos sobre", #b); )
+        : strcpy(#s, "Banda: la senal completa");
+text_l(#s, _sx, py + 176 * SC, 16 * SC);
+sprintf(#s, "Golpes detectados: %d", n_hits); text_l(#s, _sx, py + 194 * SC, 16 * SC);
+
+// ---- pie: ayuda contextual
+hint_for(hover_id);
+gfx_set(0.06, 0.065, 0.085, 1); gfx_rect(0, WH - FOOTH, WW, FOOTH, 1);
+fnt(2); gfx_set(0.70, 0.73, 0.80, 1); text_l(#hint, 12 * SC, WH - FOOTH, FOOTH);
+slider11 == 2 ? ( acc(1); text_r("ESCUCHANDO SOLO LO QUE CAMBIA", WW - 300 * SC, WH - FOOTH, 288 * SC, FOOTH); )
+: slider11 == 1 ? ( acc(1); text_r("ESCUCHANDO SOLO LA BANDA", WW - 300 * SC, WH - FOOTH, 288 * SC, FOOTH); );
